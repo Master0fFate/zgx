@@ -3355,13 +3355,21 @@ impl Ui {
                 } else {
                     Vec::new()
                 };
+                // Only those that moved: most observed nodes stay where they
+                // were as something else changes (a reply's last paragraph
+                // growing, the others not).
                 let bounds = if geometry_changed {
                     self.storage
                         .observed_bounds
                         .borrow()
                         .iter()
                         .filter(|(node, _)| scene.contains(**node))
-                        .map(|(node, signal)| (*node, signal.clone(), scene.world_bounds(*node)))
+                        .filter_map(|(node, signal)| {
+                            let now = scene.world_bounds(*node);
+                            signal
+                                .with_untracked(|told| *told != now)
+                                .then(|| (*node, signal.clone(), now))
+                        })
                         .collect()
                 } else {
                     Vec::new()
@@ -3375,8 +3383,11 @@ impl Ui {
                     .borrow()
                     .iter()
                     .filter(|(node, _)| scene.contains(**node))
-                    .map(|(node, signal)| {
-                        (*node, signal.clone(), scene.visible_bounds(*node).is_some())
+                    .filter_map(|(node, signal)| {
+                        let now = scene.visible_bounds(*node).is_some();
+                        signal
+                            .with_untracked(|told| *told != now)
+                            .then(|| (*node, signal.clone(), now))
                     })
                     .collect()
             } else {
@@ -3392,14 +3403,22 @@ impl Ui {
                         signal.set(size);
                     }
                 }
+                // Changed, as gathered above (what reads them runs after
+                // the batch): set without comparing again.
                 for (node, signal, visible) in visibility {
                     if self.scene.borrow().contains(node) {
-                        signal.set(visible);
+                        signal.mutate(|told| {
+                            *told = visible;
+                            true
+                        });
                     }
                 }
                 for (node, signal, bounds) in bounds {
                     if self.scene.borrow().contains(node) {
-                        signal.set(bounds);
+                        signal.mutate(|told| {
+                            *told = bounds;
+                            true
+                        });
                     }
                 }
             });
