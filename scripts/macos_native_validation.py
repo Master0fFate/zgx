@@ -114,7 +114,7 @@ def main():
         examples = ['native_surfaces', 'rich_text', 'platform_services', 'dynamic_menus', 'atspi',
                     'form', 'native_ime', 'layout', 'paint_styles', 'canvas', 'svg_transform', 'animated_image',
                     'component_workload', 'windows', 'window_controls', 'native_platform', 'drag_drop', 'actions', 'cursors',
-                    'transparency']
+                    'transparency', 'web_view']
         command = ['cargo', 'build', '-p', 'zgx-desktop', '--locked']
         for example in examples:
             command += ['--example', example]
@@ -138,6 +138,11 @@ def main():
         assert re.search(r'^PASS$', log, re.M) and 'FAIL' not in log, log
         log = run('rich-text-window', [str(directory / 'rich_text'), '--smoke-test'], 30)
         assert 'RICH_CLAMP height=56' in log, log
+        # A WebKit page under zgx's glass: its frame, cuts, backdrops (the
+        # frosted menu's too, in a popup window of its own past the window's
+        # edge), hit testing, focus and hiding, from AppKit's own state.
+        log = run('web-view-fixture', [str(directory / 'web_view'), '--fixture'], 120)
+        assert 'FIXTURE 0 failures' in log and 'contained a panic' not in log, log
         checklist = []
         for index, (example, instruction) in enumerate(checks):
             entry = results['manual'][index]

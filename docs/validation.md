@@ -819,6 +819,28 @@ with the window made opaque fails every kind of check above.
 verifies everything the window server is given; its own blending onto the
 desktop is not observed, which would need a capture.
 
+## A web page under glass on macOS
+
+`web_view --fixture` checks a WKWebView page in a zgx window from AppKit's
+own state, with no screen capture. The checks cover:
+
+- the page's frame, rounded cuts and CSS width following its node;
+- the composer's frosted backdrop shaped to its node, between the page and
+  the overlay plane;
+- clicks reaching WebKit or zgx by where they land, and focus going both ways;
+- the page hiding and showing again in place.
+
+The frosted menu opens past the window's right edge, so it shows in a popup
+window of its own (since 8b94376d1). Its backdrop is AppKit's material
+behind the panel there, which the report lists as an `NSVisualEffectView`
+at the menu's box with its 14-point radius; once the menu closes, it's
+gone. Before popup materials were reported, the check failed on every
+macOS run from that commit on, though the menu showed its glass; with
+`ZGX_POPUP_WINDOWS=0` (the menu inside the window) it passed.
+
+`scripts/macos_native_validation.py` runs the fixture on each macOS CI job.
+It passes 2 of 2 runs on an Apple M5 Max (macOS 26.4).
+
 ## Real Wayland input-method composition
 
 An isolated Sway/Fcitx5/Pinyin session exercises actual text-input-v3 preedit and
