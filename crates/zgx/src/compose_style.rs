@@ -560,6 +560,18 @@ fn finite_style_effects(
 /// styles without their paint properties, the interaction and disabled
 /// state, the inherited typography's version if it was read, the intrinsic
 /// size and layout target. A run that matches them changes paint alone.
+/// Whether a run that keeps the memo's inputs has paint to write
+/// (`Memo::painted`): unknown when an application settles them (it wrote
+/// the paint they give), then asked once of the paint the dynamic style
+/// sets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Painted {
+    Unknown,
+    /// No dynamic paint: what the inputs give is in the scene.
+    Written,
+    /// Dynamic paint, laid over and written each run.
+    Dynamic,
+}
 struct Settled {
     dynamic: Option<Styles>,
     paint: Option<([bool; 11], u8)>,
@@ -651,13 +663,11 @@ struct Memo {
     /// The layout style the last full application gave the node: a run that
     /// changes only box sizes and margins patches it (see `boxes`).
     shown: Option<crate::scene::Style>,
-    /// Whether the last run wrote a size change with no dynamic paint
-    /// (false after any other application). Another such run writes no
-    /// paint: a bar growing every frame re-wrote its unchanged effects,
+    /// Whether a run that keeps the memo's inputs has paint to write
+    /// (`Painted`): a bar growing every frame, or a box whose colour a moved
+    /// selection reads but did not change, re-wrote its unchanged effects,
     /// transform and clip, which also undid what else had set them since.
-    /// (Only for size changes: checking every run cost animated paint more
-    /// than it saved.)
-    painted: bool,
+    painted: Painted,
     /// What `Scene::set_box` left from patching `shown`'s box: `None` once
     /// `shown` is made or written another way.
     boxed: Option<u32>,
@@ -960,7 +970,7 @@ pub(crate) fn mount_style_with_intrinsic(
                 applied: None,
                 settled: None,
                 shown: None,
-                painted: false,
+                painted: Painted::Unknown,
                 boxed: None,
                 box_plan: None,
             }));
@@ -1131,11 +1141,20 @@ pub(crate) fn mount_style_with_intrinsic(
                     patch_sizes(style, next);
                     storage.scene.borrow_mut().set_box(node, style, boxed);
                 }
-                // The paint written last time, from the same inputs.
-                // Resized with no dynamic paint, as last time: nothing to write.
-                let none = resized && paint.is_none_or(|paint| paint == ([false; 11], 0));
-                if std::mem::replace(painted, none) && none {
-                    return;
+                // The application that settled these inputs wrote the paint
+                // they give: with no dynamic paint there is nothing to write.
+                // Asked once after it (`Painted`); animated paint, which takes
+                // this path every frame, then only reads the answer.
+                match *painted {
+                    Painted::Written => return,
+                    Painted::Dynamic => {}
+                    Painted::Unknown => {
+                        if paint.is_none_or(|paint| paint == ([false; 11], 0)) {
+                            *painted = Painted::Written;
+                            return;
+                        }
+                        *painted = Painted::Dynamic;
+                    }
                 }
                 // The paint resolved last time, with this run's laid over it:
                 // the base and the variants on are the same, and so is which
@@ -1389,6 +1408,7 @@ pub(crate) fn mount_style_with_intrinsic(
             let moves_and_fades =
                 paint.is_some_and(|p| p.transform.is_some() && p.opacity.is_some());
             let paint = paint.map(|p| p.set());
+            memo.painted = Painted::Unknown;
             memo.settled = Some(Settled {
                 dynamic: dynamic_rest,
                 paint,
@@ -1482,7 +1502,7 @@ pub(crate) fn mount_style_with_intrinsic(
                 (next.opacity, next.transform, next.local_transform);
             if previous.0 == *next {
                 // Written here from the resolved styles, not a dynamic paint.
-                *painted = false;
+                *painted = Painted::Unknown;
                 let resized = sizes
                     != (
                         next.width,
@@ -1563,7 +1583,6 @@ pub(crate) fn mount_style_with_intrinsic(
         );
         if let Some(memo) = &mut memo {
             memo.shown = Some(style);
-            memo.painted = false;
             memo.boxed = None;
         }
     });
@@ -2824,8 +2843,11 @@ mod tests {
         }
     }
 
+    /// A re-run to the same background, with no dynamic paint, writes no
+    /// paint once the run before it wrote the same: what else set the
+    /// node's effects, transform and clip since stays, as with a resize.
     #[test]
-    fn an_unchanged_background_restores_external_paint() {
+    fn an_unchanged_background_leaves_external_paint() {
         use crate::scene::{ClipInset, Effects, LocalTransform, Transform};
         let mut ui = Ui::new(200., 200.);
         let node = ui.container(ui.root(), Layout::Column, Style::default());
@@ -2864,32 +2886,42 @@ mod tests {
         );
         tick.set(1);
         tick.set(2);
-        for value in 3..6 {
-            {
-                let mut scene = ui.scene.borrow_mut();
-                scene.set_effects(
-                    node,
-                    Effects {
-                        opacity: 0.4,
-                        ..effects
-                    },
-                );
-                scene.set_transform(node, Transform { x: 50., y: 60. });
-                scene.set_local_transform(
-                    node,
-                    LocalTransform {
-                        rotate: 0.8,
-                        ..local
-                    },
-                );
-                scene.set_clip_inset(node, None);
-            }
-            tick.set(value);
+        {
+            // The runs so far wrote the node's own paint.
             let scene = ui.scene.borrow();
             assert_eq!(scene.effects(node), effects);
             assert_eq!(scene.transform(node), transform);
             assert_eq!(scene.local_transform(node), local);
             assert_eq!(scene.clip_inset(node), inset);
+        }
+        for value in 3..6 {
+            let elsewhere = (
+                Effects {
+                    opacity: 0.4 - value as f32 * 0.05,
+                    ..effects
+                },
+                Transform {
+                    x: 50. + value as f32,
+                    y: 60.,
+                },
+                LocalTransform {
+                    rotate: 0.8,
+                    ..local
+                },
+            );
+            {
+                let mut scene = ui.scene.borrow_mut();
+                scene.set_effects(node, elsewhere.0);
+                scene.set_transform(node, elsewhere.1);
+                scene.set_local_transform(node, elsewhere.2);
+                scene.set_clip_inset(node, None);
+            }
+            tick.set(value);
+            let scene = ui.scene.borrow();
+            assert_eq!(scene.effects(node), elsewhere.0);
+            assert_eq!(scene.transform(node), elsewhere.1);
+            assert_eq!(scene.local_transform(node), elsewhere.2);
+            assert_eq!(scene.clip_inset(node), None);
         }
     }
 
