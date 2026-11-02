@@ -2305,6 +2305,10 @@ const PERCENT_WIDTH: u8 = 8;
 const PERCENT_HEIGHT: u8 = 16;
 const OWN_PERCENT_WIDTH: u8 = 32;
 const OWN_PERCENT_HEIGHT: u8 = 64;
+/// Not known (`READS_KNOWN` cleared, so every layout reads it afresh), but
+/// what it read before a change below it, kept for `relayout_alone` to
+/// compare.
+const READS_KEPT: u8 = 128;
 /// Which way a node's lines run (CSS's `direction`), inherited by its
 /// subtree: rows run from the right, text starts at the right, and the
 /// arrows read the other way.
@@ -2939,8 +2943,10 @@ pub struct Scene {
     /// The deepest stack and the item count of the last paint walk
     /// (`layer_items_within`): the next one starts at those sizes.
     walk_hints: std::cell::Cell<(usize, usize)>,
-    /// Dirty fixed-size containers whose ancestors stayed clean.
-    layout_roots: Vec<NodeId>,
+    /// Dirty fixed-size containers whose ancestors stayed clean, and
+    /// children of rows and columns a walk stopped at (`stops_alone`).
+    /// Inline: a frame's few need no allocation.
+    layout_roots: smallvec::SmallVec<[NodeId; 2]>,
     /// How deep the contents syncs running now nest (`sync_contents`).
     syncing: u32,
     /// Nodes holding more than `MEASUREMENT_ALTERNATES` results of this pass,
@@ -3163,7 +3169,7 @@ impl Scene {
             scratch: Vec::new(),
             content_revision: 0,
             walk_hints: Default::default(),
-            layout_roots: Vec::new(),
+            layout_roots: smallvec::SmallVec::new(),
             syncing: 0,
             overfull: Vec::new(),
             relative_count: 0,
@@ -7903,10 +7909,24 @@ impl Scene {
     #[inline(always)]
     fn invalidate_layout_with(&mut self, id: NodeId, keep_reads: bool, own: bool) {
         let layers = self.isolation_count + self.promoted_count > 0;
+        // A leaf's content changed (a text, an image): its ancestors may
+        // answer as they did. A container's children or style: they won't,
+        // and none is laid out alone (`stops_alone`).
+        let leaf = !matches!(
+            self.node(id).kind,
+            NodeKind::Container(_) | NodeKind::Panel { .. }
+        );
         let mut current = id;
         let mut first = true;
+        // A node on the way up never laid out (just mounted): what it is in
+        // changed, and none above it is laid out alone.
+        let mut fresh = false;
         let mut marked = 0u64;
         let (mut parent, mut ink) = loop {
+            // Above `id`, a child of a plain row or column whose answers to
+            // it may not have changed: laid out alone if they haven't
+            // (`relayout_alone`), its siblings left where they are.
+            let alone = leaf && !first && !fresh && self.stops_alone(current);
             // Past `id`, a parent the tree led to (`tree_node_mut`).
             let node = if first {
                 self.node_mut(current)
@@ -7914,6 +7934,7 @@ impl Scene {
                 self.tree_node_mut(current)
             };
             let boundary = !first && Self::is_layout_boundary(node);
+            fresh |= node.measurement.is_none();
             let parent = node.parent;
             let ink = node.bounds_valid.replace(0);
             node.dirty |= LAYOUT;
@@ -7922,7 +7943,13 @@ impl Scene {
             }
             if !keep_reads {
                 node.text_size.set(TextSizes::default());
-                node.reads.set(0);
+                // One laid out alone keeps what it read, as unknown:
+                // `relayout_alone` checks it reads the same.
+                let read = node.reads.get();
+                node.reads.set(match alone {
+                    true => (read & !READS_KNOWN) | READS_KEPT,
+                    false => 0,
+                });
             }
             if layers {
                 marked = marked.wrapping_add(1);
@@ -7934,7 +7961,7 @@ impl Scene {
                 node.queued = true;
                 self.dirty.push(current);
             }
-            if boundary {
+            if boundary || alone {
                 if self.layout_roots.last() != Some(&current) {
                     self.layout_roots.push(current);
                 }
@@ -7968,6 +7995,80 @@ impl Scene {
                 parent = node.parent;
             }
         }
+    }
+    /// Whether the walk up from a change stops at `id`, a child of a plain
+    /// row or column, to lay it out alone (`relayout_alone`): laid out
+    /// before, in the flow, its parent's layout plain (no grid, wrap or
+    /// baseline: no `advanced_layout`) and answering one size alone (no
+    /// alternates or kept sizes: only the results `id` holds were asked
+    /// of it), and what it reads known. Not `id` changed itself: its style
+    /// is its parent's to read.
+    #[inline]
+    fn stops_alone(&self, id: NodeId) -> bool {
+        let node = self.tree_node(id);
+        // One result, the one its parent asked for: a child its parent
+        // asked more of (its natural width, to stretch it to the widest)
+        // changes what it answers there often, and its parent lays it out.
+        if node.measurement.is_none()
+            || !node.alternates.is_empty()
+            || !node.sizes.is_empty()
+            || node.style.absolute
+            || node.special.any()
+            || node.reads.get() & READS_KNOWN == 0
+        {
+            return false;
+        }
+        let Some(parent) = node.parent else {
+            return false;
+        };
+        let parent = self.tree_node(parent);
+        matches!(
+            parent.kind,
+            NodeKind::Container(Layout::Row | Layout::Column)
+                | NodeKind::Panel {
+                    layout: Layout::Row | Layout::Column,
+                    ..
+                }
+        ) && parent.advanced_layout.is_none()
+            && !parent.special.any()
+            && parent.measurement.is_some()
+            && parent.alternates.is_empty()
+            && parent.sizes.is_empty()
+    }
+    /// `id`, where a walk stopped (`stops_alone`), laid out again under the
+    /// one constraint its parent asked it: if it gives what it did, and it
+    /// reads what it did, its parent's layout stands, and `id` alone is laid
+    /// out. Otherwise, false: laid out as usual (what this measured serves
+    /// that layout).
+    #[inline(never)]
+    fn relayout_alone(&mut self, id: NodeId) -> bool {
+        let node = self.node(id);
+        let (Some(parent), Some((asked, was))) = (
+            node.parent,
+            node.measurement.as_ref().map(|m| (m.constraints, m.size)),
+        ) else {
+            return false;
+        };
+        // What it read before the change (`READS_KEPT`); gone if a layout
+        // read it afresh since.
+        let read = node.reads.get();
+        let kept_reads = match (read & READS_KEPT != 0, read & READS_KNOWN != 0) {
+            (true, _) => (read & !READS_KEPT) | READS_KNOWN,
+            (false, true) => read,
+            (false, false) => return false,
+        };
+        // Sized along by its parent (grown or shrunk: flexed): how far it
+        // gives depends on more than the result it holds (its content's
+        // floor), so its parent lays it out.
+        let flexed = match self.node(parent).kind {
+            NodeKind::Container(Layout::Row)
+            | NodeKind::Panel {
+                layout: Layout::Row,
+                ..
+            } => asked.force_width,
+            _ => asked.force_height,
+        };
+        flexed.is_none() && self.reads_bits(id) == kept_reads && self.measure_full(id, asked) == was
     }
     /// A laid-out container with an explicit width and height: parents measure
     /// it from those (or from their own flex allocation), never from its
@@ -10528,9 +10629,28 @@ impl Scene {
         // Each root's depth worked out once, not at every comparison.
         roots.sort_by_cached_key(|id| (self.depth(*id), id.index, id.generation));
         roots.dedup();
+        // Kept until all are laid out: a pass that panics (a measurer's)
+        // leaves them to the next, rather than nothing marked to do.
+        self.layout_roots = roots;
         let mut relayout_all = false;
-        for id in roots {
+        let mut alone: smallvec::SmallVec<[NodeId; 16]> = smallvec::SmallVec::new();
+        let mut at = 0;
+        while let Some(&id) = self.layout_roots.get(at) {
+            at += 1;
             if !self.contains(id) || self.node(id).dirty & LAYOUT == 0 {
+                continue;
+            }
+            // Not a boundary: a child a walk stopped at (`stops_alone`).
+            // Measured now and placed once all are known to stand: one that
+            // doesn't sends the scene through a full layout, which takes
+            // every one of them as this pass measured it.
+            if !Self::is_layout_boundary(self.node(id)) {
+                if relayout_all || !self.relayout_alone(id) {
+                    relayout_all = true;
+                    self.invalidate_layout_to_root(id);
+                } else {
+                    alone.push(id);
+                }
                 continue;
             }
             let Some((constraints, size)) = self
@@ -10552,7 +10672,26 @@ impl Scene {
             let bounds = self.node(id).bounds;
             self.arrange_from(id, bounds.x, bounds.y, &mut report);
         }
+        // Let go, as before: an idle scene holds no room for the next.
+        self.layout_roots = smallvec::SmallVec::new();
+        if relayout_all {
+            // Taken by the full layout below, as this pass measured them.
+            for &id in &alone {
+                self.invalidate_layout_to_root(id);
+            }
+        } else {
+            for id in alone {
+                let bounds = self.node(id).bounds;
+                self.arrange_from(id, bounds.x, bounds.y, &mut report);
+            }
+        }
         if relayout_all && self.node(self.root).dirty & LAYOUT != 0 {
+            // After a full layout above, a new pass: what it measured took
+            // the old answers of the root that fell back, and none may serve
+            // now. (Roots laid out before measure only below themselves.)
+            if full {
+                self.layout_pass = self.layout_pass.wrapping_add(1);
+            }
             self.measure_full(self.root, Constraints::default());
             self.arrange_from(self.root, 0.0, 0.0, &mut report);
         }
